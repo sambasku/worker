@@ -1,3 +1,15 @@
-name: CircleCI
+name: CI
 
-# Maintainer: Actions → CircleCI → Run workflow
+# Repo ini untuk job manual (lihat sync-db-prod-to-staging.yml).
+# Workflow ini no-op supaya tab Actions punya entry yang jelas.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "OK - pakai Sync DB Prod → Staging (manual) untuk transfer DB"

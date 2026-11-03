@@ -1,0 +1,119 @@
+name: Sync DB Prod → Staging (manual)
+
+# Wipe staging lalu salin penuh dari production (PII ikut).
+# TIDAK otomatis saat push.
+#
+# CLI:
+#   gh workflow run sync-db-prod-to-staging.yml --repo sambasku/worker --ref main -f confirm=true
+#
+# Secrets org:
+#   DB_PRODUCTION_TURSO_URL / DB_PRODUCTION_TURSO_AUTH_TOKEN
+#   DB_STAGING_TURSO_URL / DB_STAGING_TURSO_AUTH_TOKEN
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Centang = wipe staging lalu salin penuh dari production (PII ikut)'
+        type: boolean
+        required: true
+        default: false
+
+jobs:
+  sync:
+    if: ${{ inputs.confirm }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+
+      - name: Cek secrets DB (org)
+        env:
+          SOURCE_DATABASE_URL: ${{ secrets.DB_PRODUCTION_TURSO_URL }}
+          SOURCE_DATABASE_AUTH_TOKEN: ${{ secrets.DB_PRODUCTION_TURSO_AUTH_TOKEN }}
+          DEST_DATABASE_URL: ${{ secrets.DB_STAGING_TURSO_URL }}
+          DEST_DATABASE_AUTH_TOKEN: ${{ secrets.DB_STAGING_TURSO_AUTH_TOKEN }}
+        run: |
+          if [ -z "$SOURCE_DATABASE_URL" ]; then
+            echo "::error::Secret DB_PRODUCTION_TURSO_URL kosong"
+            exit 1
+          fi
+          if [ -z "$SOURCE_DATABASE_AUTH_TOKEN" ]; then
+            echo "::error::Secret DB_PRODUCTION_TURSO_AUTH_TOKEN kosong"
+            exit 1
+          fi
+          if [ -z "$DEST_DATABASE_URL" ]; then
+            echo "::error::Secret DB_STAGING_TURSO_URL kosong"
+            exit 1
+          fi
+          if [ -z "$DEST_DATABASE_AUTH_TOKEN" ]; then
+            echo "::error::Secret DB_STAGING_TURSO_AUTH_TOKEN kosong"
+            exit 1
+          fi
+          SRC_HOST=$(echo "$SOURCE_DATABASE_URL" | sed -E 's#^[a-z]+://##' | cut -d/ -f1)
+          DEST_HOST=$(echo "$DEST_DATABASE_URL" | sed -E 's#^[a-z]+://##' | cut -d/ -f1)
+          echo "SOURCE host: $SRC_HOST"
+          echo "DEST host: $DEST_HOST"
+          if [ "$DEST_HOST" != "db-sambasku-staging.iamutaki.com" ]; then
+            echo "::error::DEST host harus db-sambasku-staging.iamutaki.com (dapat: $DEST_HOST)"
+            exit 1
+          fi
+          case "$DEST_HOST" in
+            data.sambasku.com|*db-prod-sambasku*)
+              echo "::error::DEST mengarah ke production"
+              exit 1
+              ;;
+          esac
+
+      - name: Sync prod → staging (wipe dest)
+        run: pnpm sync-prod-staging -- --i-understand-dest-will-be-wiped
+        env:
+          SOURCE_DATABASE_URL: ${{ secrets.DB_PRODUCTION_TURSO_URL }}
+          SOURCE_DATABASE_AUTH_TOKEN: ${{ secrets.DB_PRODUCTION_TURSO_AUTH_TOKEN }}
+          DEST_DATABASE_URL: ${{ secrets.DB_STAGING_TURSO_URL }}
+          DEST_DATABASE_AUTH_TOKEN: ${{ secrets.DB_STAGING_TURSO_AUTH_TOKEN }}
+
+  notify:
+    needs: [sync]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kirim hasil CI ke Telegram
+        uses: appleboy/telegram-action@v1.1.0
+        with:
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          to: ${{ secrets.TELEGRAM_TO }}
+          message: |
+            ${{ contains(needs.*.result, 'failure') && '❌ Gagal' || (contains(needs.*.result, 'cancelled') && '⚠️ Dibatalkan' || (inputs.confirm && '✅ Sukses' || '⏭️ Skip (confirm=false)')) }} CI sambasku/worker — Sync DB Prod → Staging (manual)
+            Branch: ${{ github.ref_name }} · Commit: ${{ github.sha }}
+            https://github.com/sambasku/worker/actions/runs/${{ github.run_id }}
+      - name: Kirim hasil CI ke Discord
+        if: always()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          STATUS: "${{ contains(needs.*.result, 'failure') && '❌ Gagal' || (contains(needs.*.result, 'cancelled') && '⚠️ Dibatalkan' || (inputs.confirm && '✅ Sukses' || '⏭️ Skip (confirm=false)')) }}"
+          REPO: sambasku/worker
+          WORKFLOW: Sync DB Prod → Staging (manual)
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          RUN_URL: "https://github.com/sambasku/worker/actions/runs/${{ github.run_id }}"
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "Skip: DISCORD_WEBHOOK_URL tidak diset."
+            exit 0
+          fi
+          MSG="$STATUS CI $REPO — $WORKFLOW
+          Branch: $BRANCH · Commit: $SHA
+          $RUN_URL"
+          jq -n --arg content "$MSG" '{{content: $content}}' \
+            | curl -sf -X POST -H 'Content-Type: application/json' \
+                -d @- "$DISCORD_WEBHOOK_URL" \
+            || echo "Discord webhook gagal (best-effort, job tidak gagal)"
